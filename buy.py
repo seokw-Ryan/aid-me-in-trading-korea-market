@@ -5,12 +5,77 @@ from datetime import datetime, timedelta
 import sys
 import time
 import threading
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
 
 # Get KOSPI tickers
 kospi_tickers = stock.get_market_ticker_list(market="KOSPI")
 
 # Get KOSDAQ tickers
 kosdaq_tickers = stock.get_market_ticker_list(market="KOSDAQ")
+
+
+def process_ticker(ticker, start_date, end_date):
+    try:
+        # Get stock data
+        df = stock.get_market_ohlcv_by_date(start_date, end_date, ticker)
+
+        # Handle empty or missing data
+        if df.empty:
+            print(f"\nNo data available for ticker {ticker}. Skipping.")
+            return None
+
+        # Ensure the required columns exist
+        required_columns = ['종가']
+        if not all(col in df.columns for col in required_columns):
+            print(f"\nMissing required columns for ticker {ticker}. Columns found: {df.columns}")
+            return None
+
+        # Calculate 20-day moving average
+        df['MA20'] = df['종가'].rolling(window=20).mean()
+
+        # Drop rows with NaN values in 'MA20'
+        df = df.dropna(subset=['MA20'])
+
+        if len(df) < 2:
+            return None
+
+        # Get the latest date in the data
+        latest_date = df.index[-1]
+        latest_date_str = latest_date.strftime('%Y%m%d')
+
+        # Get market cap data for the latest date
+        market_cap_df = stock.get_market_cap(latest_date_str)
+
+        # Check market cap
+        if ticker not in market_cap_df.index or market_cap_df.loc[ticker, '시가총액'] < 500_000_000_000:
+            return None
+
+        # Get today's and yesterday's closing prices
+        today_close = df['종가'].iloc[-1]
+        yesterday_close = df['종가'].iloc[-2]
+
+        # Check if the stock increased today
+        if today_close <= yesterday_close:
+            return None
+
+        # Check if today's closing price is higher than the 20-day moving average
+        today_ma20 = df['MA20'].iloc[-1]
+        if today_close <= today_ma20:
+            return None
+
+        # If all criteria are met, return the result
+        return {
+            'Ticker': ticker,
+            'Date': latest_date.strftime("%Y-%m-%d"),
+            'Price': today_close,
+            'MA20': today_ma20
+        }
+
+    except Exception as e:
+        print(f"\nError processing {ticker}: {e}")
+        return None
+
 
 def combine_tickers():
     print("Combining KOSPI and KOSDAQ tickers...")
@@ -54,6 +119,9 @@ def find_stocks_to_buy():
 
     stocks_to_buy = []
 
+    total_stocks = len(tickers_df)
+    tickers = tickers_df['Ticker'].tolist()
+
     # Create a flag for stopping the animation
     stop_animation = threading.Event()
 
@@ -62,42 +130,24 @@ def find_stocks_to_buy():
     loading_thread.daemon = True
     loading_thread.start()
 
-    total_stocks = len(tickers_df)
-    for index, ticker in enumerate(tickers_df['Ticker'], 1):
-        try:
+    with ProcessPoolExecutor() as executor:
+        # Submit all tasks to the executor
+        futures = {executor.submit(process_ticker, ticker, start_date, end_date): ticker for ticker in tickers}
+
+        # As each task completes, process the result
+        for index, future in enumerate(as_completed(futures), 1):
+            ticker = futures[future]
+            try:
+                result = future.result()
+                if result:
+                    stocks_to_buy.append(result)
+            except Exception as e:
+                print(f"\nError processing {ticker}: {e}")
+
             # Update progress
             progress = f"\rProcessing... {index}/{total_stocks} stocks"
             sys.stdout.write(progress)
             sys.stdout.flush()
-
-            # Get stock data
-            df = stock.get_market_ohlcv_by_date(start_date, end_date, ticker)
-
-            if len(df) < 20:
-                continue
-
-            # Calculate 20-day moving average
-            df['MA20'] = df['종가'].rolling(window=20).mean()
-
-            # Drop rows with NaN values in 'MA20'
-            df = df.dropna(subset=['MA20'])
-
-            # Check if the stock meets the criteria
-            for i in range(1, len(df)):
-                if (df['종가'].iloc[i] > df['종가'].iloc[i - 1] and
-                        df['종가'].iloc[i] > df['MA20'].iloc[i] and
-                        df['종가'].iloc[i - 1] <= df['MA20'].iloc[i - 1]):
-
-                    stocks_to_buy.append({
-                        'Ticker': ticker,
-                        'Date': df.index[i].strftime("%Y-%m-%d"),
-                        'Price': df['종가'].iloc[i],
-                        'MA20': df['MA20'].iloc[i]
-                    })
-                    break  # Move to the next stock after finding a match
-
-        except Exception as e:
-            print(f"\nError processing {ticker}: {e}")
 
     # Stop the loading animation
     stop_animation.set()
@@ -111,12 +161,21 @@ def find_stocks_to_buy():
     result_df = pd.DataFrame(stocks_to_buy)
 
     if not result_df.empty:
+        # Get stock names
+        tickers = result_df['Ticker'].tolist()
+        stock_names = get_stock_names(tickers)
+        result_df['Name'] = result_df['Ticker'].map(stock_names)
+
+        # Reorder columns
+        result_df = result_df[['Ticker', 'Name', 'Date', 'Price', 'MA20']]
+
         print("\nStocks meeting the criteria:")
         print(result_df)
         result_df.to_csv('stocks_to_buy.csv', index=False)
         print("Results exported to 'stocks_to_buy.csv'")
     else:
         print("\nNo stocks found meeting the criteria.")
+
 
 def get_stock_names(tickers):
     return {ticker: stock.get_market_ticker_name(ticker) for ticker in tickers}
